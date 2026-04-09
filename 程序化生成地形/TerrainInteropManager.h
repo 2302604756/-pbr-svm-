@@ -1,119 +1,166 @@
 ﻿#pragma once
-#pragma once
 
 #include <d3d11.h>
 #include <cuda_runtime.h>
 #include <cuda_d3d11_interop.h>
 #include <iostream>
+#include <vector>
+#include <map>
+#include <cmath>
 
-// 保持与 CUDA 代码中的结构体完全一致
+// 保持与 CUDA 代码中的结构体完全一致 (32字节对齐)
 struct TerrainVertex {
-    float x, y, z;       // 12 字节
-    float nx, ny, nz;    // 12 字节
-    float u, v;          // 8 字节
+    float x, y, z;
+    float nx, ny, nz;
+    float u, v;
 };
-// 确保 sizeof(TerrainVertex) 等于 32！
 
-// 声明定义在 .cu 文件中的外部函数
-extern "C" void LaunchTerrainKernel(TerrainVertex* d_vertices, int gridSize, float offsetZ);
+// 1. Chunk 数据实体
+struct TerrainChunk {
+    int logicalX, logicalZ;        // 区块逻辑坐标 (比如 0, 1)
+    float worldX, worldZ;          // 转换后的物理起始坐标
+    ID3D11Buffer* pVertexBuffer = nullptr;   // 固定的 DX11 显存块
+    cudaGraphicsResource_t pCudaRes = nullptr; // 固定的 CUDA 映射句柄
+    bool isActive = false;         // 是否正在被使用
+};
+
+// 外部 CUDA 函数 (注意参数变成了 worldOffsetX 和 worldOffsetZ)
+extern "C" void LaunchTerrainKernel(TerrainVertex* d_vertices, int gridSize, float worldOffsetX, float worldOffsetZ);
 
 class TerrainInteropManager {
 private:
-    ID3D11Buffer* m_vertexBuffer = nullptr;
-    cudaGraphicsResource_t m_cudaResource = nullptr;
+    const int GRID_SIZE = 128;            // 每个 Chunk 128x128 个顶点 (太大容易卡顿)
+    const float SPACING = 1.5f;           // 顶点间距
+    const float CHUNK_SIZE = (GRID_SIZE - 1) * SPACING; // 单个 Chunk 的物理边长 = 190.5 米
+    const int VIEW_DISTANCE = 2;          // 渲染半径 (2 代表 5x5 = 25 个区块)
+    const int POOL_SIZE = 36;             // 显存池容量 (必须大于渲染区块数)
+    int m_verticesPerChunk = 0;
 
-    // 我们生成一个 128 x 128 的大网格
-    const int GRID_SIZE = 256;
-    int m_totalVertices = 0;
-    float m_timeOffset = 0.0f;
+    std::vector<TerrainChunk> m_chunkPool; // 物理显存池
+    std::map<std::pair<int, int>, TerrainChunk*> m_activeChunks; // 活跃区块字典
+
+    // 辅助函数：从池子里找一块空闲的显存
+    TerrainChunk* GetFreeChunk() {
+        for (auto& chunk : m_chunkPool) {
+            if (!chunk.isActive) return &chunk;
+        }
+        return nullptr; // 池子满了！
+    }
 
 public:
     TerrainInteropManager() = default;
     ~TerrainInteropManager() { Cleanup(); }
 
-    // 1. 初始化系统
+    // ==========================================
+    // 1. 初始化系统：一次性申请所有显存
+    // ==========================================
     bool Initialize(ID3D11Device* d3dDevice) {
-        // (N-1) * (N-1) 个格子，每个格子 2 个三角形 (6个点)
-        m_totalVertices = (GRID_SIZE - 1) * (GRID_SIZE - 1) * 6;
+        m_verticesPerChunk = (GRID_SIZE - 1) * (GRID_SIZE - 1) * 6;
 
-        // 让 CUDA 绑定到当前运行 DX11 的这块显卡上
         unsigned int deviceCount = 0;
         int cudaDevice = 0;
-        // 注意这里用的是 GetDevices (复数形式)，它完美兼容 ID3D11Device*
         cudaError_t err = cudaD3D11GetDevices(&deviceCount, &cudaDevice, 1, d3dDevice, cudaD3D11DeviceListAll);
-
-        if (err != cudaSuccess || deviceCount == 0) {
-            std::cerr << "CUDA 获取 DX11 设备失败!" << std::endl;
-            return false;
-        }
+        if (err != cudaSuccess || deviceCount == 0) return false;
         cudaSetDevice(cudaDevice);
 
-        // 创建 DX11 顶点缓冲区 (只分配显存，不填数据，数据由 CUDA 算)
-        D3D11_BUFFER_DESC bd = {};
-        bd.Usage = D3D11_USAGE_DEFAULT;
-        bd.ByteWidth = sizeof(TerrainVertex) * m_totalVertices;
-        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        m_chunkPool.resize(POOL_SIZE);
 
-        HRESULT hr = d3dDevice->CreateBuffer(&bd, nullptr, &m_vertexBuffer);
-        if (FAILED(hr)) {
-            std::cerr << "DX11 创建顶点缓冲区失败!" << std::endl;
-            return false;
+        for (int i = 0; i < POOL_SIZE; ++i) {
+            D3D11_BUFFER_DESC bd = {};
+            bd.Usage = D3D11_USAGE_DEFAULT;
+            bd.ByteWidth = sizeof(TerrainVertex) * m_verticesPerChunk;
+            bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+
+            if (FAILED(d3dDevice->CreateBuffer(&bd, nullptr, &m_chunkPool[i].pVertexBuffer))) return false;
+
+            err = cudaGraphicsD3D11RegisterResource(&m_chunkPool[i].pCudaRes, m_chunkPool[i].pVertexBuffer, cudaGraphicsRegisterFlagsNone);
+            if (err != cudaSuccess) return false;
+
+            m_chunkPool[i].isActive = false;
         }
-
-        // 核心：把这个 DX11 资源注册进 CUDA 系统，办好“暂住证”
-        err = cudaGraphicsD3D11RegisterResource(&m_cudaResource, m_vertexBuffer, cudaGraphicsRegisterFlagsNone);
-        if (err != cudaSuccess) {
-            std::cerr << "CUDA 注册 DX11 资源失败!" << std::endl;
-            return false;
-        }
-
         return true;
     }
 
-    // 2. 更新系统 (每帧调用)
-    void Update(float deltaTime) {
-        // 让地形随着时间不断向 Z 轴前方延伸 (产生向前飞行的错觉)
-        m_timeOffset += deltaTime * 20.0f;
+    // ==========================================
+    // 2. 调度系统：回收与重生 (核心对象池逻辑)
+    // ==========================================
+    void Update(float playerWorldX, float playerWorldZ) {
+        // 计算玩家当前踩在哪一块逻辑坐标上
+        int pCX = (int)floor(playerWorldX / CHUNK_SIZE);
+        int pCZ = (int)floor(playerWorldZ / CHUNK_SIZE);
 
-        // 拿过画笔：锁定资源，DX11 暂时不能碰
-        cudaGraphicsMapResources(1, &m_cudaResource, 0);
+        // --- 阶段 A：回收 (把视野外的 Chunk 踢回对象池) ---
+        for (auto it = m_activeChunks.begin(); it != m_activeChunks.end(); ) {
+            TerrainChunk* chunk = it->second;
+            if (abs(chunk->logicalX - pCX) > VIEW_DISTANCE || abs(chunk->logicalZ - pCZ) > VIEW_DISTANCE) {
+                chunk->isActive = false; // 标记为空闲
+                it = m_activeChunks.erase(it); // 从活跃字典中移除
+            }
+            else {
+                ++it;
+            }
+        }
 
-        // 获取显存中的指针
-        TerrainVertex* d_vertices = nullptr;
-        size_t numBytes;
-        cudaGraphicsResourceGetMappedPointer((void**)&d_vertices, &numBytes, m_cudaResource);
+        // --- 阶段 B：重生 (为视野内的新领地呼叫 CUDA) ---
+        for (int x = pCX - VIEW_DISTANCE; x <= pCX + VIEW_DISTANCE; ++x) {
+            for (int z = pCZ - VIEW_DISTANCE; z <= pCZ + VIEW_DISTANCE; ++z) {
+                // 如果这个坐标还没有被加载
+                if (m_activeChunks.find({ x, z }) == m_activeChunks.end()) {
+                    TerrainChunk* chunk = GetFreeChunk();
+                    if (chunk) {
+                        // 赋予它新的使命
+                        chunk->logicalX = x;
+                        chunk->logicalZ = z;
+                        chunk->worldX = x * CHUNK_SIZE;
+                        chunk->worldZ = z * CHUNK_SIZE;
+                        chunk->isActive = true;
+                        m_activeChunks[{x, z}] = chunk;
 
-        // 发射核函数：几万个 CUDA 线程瞬间算出地形高度和颜色
-        LaunchTerrainKernel(d_vertices, GRID_SIZE, m_timeOffset);
+                        // 呼叫 CUDA 重新填充这块旧显存
+                        cudaGraphicsMapResources(1, &chunk->pCudaRes, 0);
+                        TerrainVertex* d_vertices = nullptr;
+                        size_t numBytes;
+                        cudaGraphicsResourceGetMappedPointer((void**)&d_vertices, &numBytes, chunk->pCudaRes);
 
-        // 归还画笔：算完了，解锁资源给 DX11 去画
-        cudaGraphicsUnmapResources(1, &m_cudaResource, 0);
+                        // 传入当前的物理绝对偏移量
+                        LaunchTerrainKernel(d_vertices, GRID_SIZE, chunk->worldX, chunk->worldZ);
+
+                        cudaGraphicsUnmapResources(1, &chunk->pCudaRes, 0);
+                    }
+                }
+            }
+        }
     }
 
-    // 3. 渲染命令提交 (每帧调用)
+    // ==========================================
+    // 3. 渲染命令提交：把周围的区块全画出来
+    // ==========================================
     void Render(ID3D11DeviceContext* d3dContext) {
-        if (!m_vertexBuffer) return;
-
         UINT stride = sizeof(TerrainVertex);
         UINT offset = 0;
-
-        // 设置我们刚刚被 CUDA 填满心血的 Buffer
-        d3dContext->IASetVertexBuffers(0, 1, &m_vertexBuffer, &stride, &offset);
         d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-        // 让显卡画出来！
-        d3dContext->Draw(m_totalVertices, 0);
+        // 遍历所有活着的区块，依次绘制
+        for (auto const& [coord, chunk] : m_activeChunks) {
+            d3dContext->IASetVertexBuffers(0, 1, &chunk->pVertexBuffer, &stride, &offset);
+            d3dContext->Draw(m_verticesPerChunk, 0);
+        }
     }
 
+    // ==========================================
     // 4. 打扫战场
+    // ==========================================
     void Cleanup() {
-        if (m_cudaResource) {
-            cudaGraphicsUnregisterResource(m_cudaResource);
-            m_cudaResource = nullptr;
+        for (auto& chunk : m_chunkPool) {
+            if (chunk.pCudaRes) {
+                cudaGraphicsUnregisterResource(chunk.pCudaRes);
+                chunk.pCudaRes = nullptr;
+            }
+            if (chunk.pVertexBuffer) {
+                chunk.pVertexBuffer->Release();
+                chunk.pVertexBuffer = nullptr;
+            }
         }
-        if (m_vertexBuffer) {
-            m_vertexBuffer->Release();
-            m_vertexBuffer = nullptr;
-        }
+        m_activeChunks.clear();
     }
 };

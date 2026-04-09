@@ -44,6 +44,22 @@ ID3D11SamplerState* g_pShadowSampler = nullptr;   // 纹理采样器
 ID3D11ShaderResourceView* g_pAlbedoSRV = nullptr; // 岩石底色图
 ID3D11ShaderResourceView* g_pNormalSRV = nullptr; // 水珠/岩石法线图
 ID3D11SamplerState* g_pWrapSampler = nullptr;     // 允许贴图无限重复的采样器
+// 新增贴图资源
+ID3D11ShaderResourceView* g_pRockAlbedoSRV = nullptr;  // t1 
+ID3D11ShaderResourceView* g_pRockNormalSRV = nullptr;  // t2
+ID3D11ShaderResourceView* g_pGrassAlbedoSRV = nullptr; // t3
+ID3D11ShaderResourceView* g_pGrassNormalSRV = nullptr; // t4
+ID3D11ShaderResourceView* g_pSnowAlbedoSRV = nullptr;  // t5
+ID3D11ShaderResourceView* g_pSnowNormalSRV = nullptr;  // t6
+
+
+// --- 全局变量区新增 ---
+ID3D11Texture2D* g_pVSMBlurTexture = nullptr;
+ID3D11RenderTargetView* g_pVSMBlurRTV = nullptr;  // 写模糊图的画板
+ID3D11ShaderResourceView* g_pVSMBlurSRV = nullptr;// 读模糊图的眼镜
+
+ID3D11PixelShader* g_pBlurPixelShader = nullptr;
+ID3D11Buffer* g_pBlurConstantBuffer = nullptr;    // 用来传 BlurDir
 
 // ==========================================
 // 【新增】自由摄像机状态
@@ -90,12 +106,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     return DefWindowProc(hWnd, message, wParam, lParam);
 }
 
+
 // ==========================================
-// DX11 万能贴图加载器
+// DX11 万能贴图加载器 (带自动 Mipmap 生成)
 // ==========================================
 bool LoadTextureToDX11(const char* filename, ID3D11ShaderResourceView** outSRV) {
     int width, height, channels;
-    // 强制要求读取 4 个通道 (RGBA)，因为 DX11 最喜欢 R8G8B8A8_UNORM
     unsigned char* data = stbi_load(filename, &width, &height, &channels, 4);
     if (!data) {
         MessageBoxA(NULL, "贴图加载失败！请检查文件名和路径。", filename, MB_OK | MB_ICONERROR);
@@ -106,26 +122,36 @@ bool LoadTextureToDX11(const char* filename, ID3D11ShaderResourceView** outSRV) 
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width = width;
     desc.Height = height;
-    desc.MipLevels = 1;
+    // 【核心修复 1】设为 0，代表告诉显卡：我要你帮我生成完整的 Mipmap 链！
+    desc.MipLevels = 0;
     desc.ArraySize = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    // 2. 把内存里的像素数据装填进去
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = data;
-    initData.SysMemPitch = width * 4; // 一行的字节数
+    // 【核心修复 2】必须加上 RENDER_TARGET 标记，显卡才能在后台把缩略图画出来
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
 
     ID3D11Texture2D* pTexture = nullptr;
-    g_pd3dDevice->CreateTexture2D(&desc, &initData, &pTexture);
+    // 【核心修复 3】不能传 initData！先创建一张空的 GPU 画布
+    g_pd3dDevice->CreateTexture2D(&desc, nullptr, &pTexture);
+
+    // 2. 把我们读到的最高清的原图，手动拷贝到第 0 级 (最清晰的一级)
+    g_pImmediateContext->UpdateSubresource(pTexture, 0, nullptr, data, width * 4, 0);
 
     // 3. 给 Shader 戴上“眼镜” (创建 SRV)
-    g_pd3dDevice->CreateShaderResourceView(pTexture, nullptr, outSRV);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = desc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    srvDesc.Texture2D.MipLevels = -1; // 告诉 Shader 可以访问所有的 Mip 层级
+    g_pd3dDevice->CreateShaderResourceView(pTexture, &srvDesc, outSRV);
+
+    // 4. 【魔法指令】命令 GPU 根据第 0 级，自动生成后面所有的模糊缩略图！
+    g_pImmediateContext->GenerateMips(*outSRV);
 
     pTexture->Release();
-    stbi_image_free(data); // 释放内存，防止泄漏
+    stbi_image_free(data);
     return true;
 }
 
@@ -314,6 +340,28 @@ bool InitDX11(HWND hWnd) {
     g_pd3dDevice->CreateRenderTargetView(g_pVSMTexture, nullptr, &g_pVSMRTV);
     g_pd3dDevice->CreateShaderResourceView(g_pVSMTexture, nullptr, &g_pVSMSRV);
 
+    //高斯模糊
+
+    // 1. 创建一模一样的备用 VSM 纹理（用于水平模糊的中转）
+    g_pd3dDevice->CreateTexture2D(&vsmDesc, nullptr, &g_pVSMBlurTexture);
+    g_pd3dDevice->CreateRenderTargetView(g_pVSMBlurTexture, nullptr, &g_pVSMBlurRTV);
+    g_pd3dDevice->CreateShaderResourceView(g_pVSMBlurTexture, nullptr, &g_pVSMBlurSRV);
+
+    // 2. 编译并创建 BlurPS
+    ID3DBlob* pBlurPSBlob = nullptr;
+    hr = D3DCompileFromFile(L"Shader.hlsl", nullptr, nullptr, "BlurPS", "ps_5_0", 0, 0, &pBlurPSBlob, &errorBlob);
+    if (FAILED(hr)) { /* 记得做错误捕捉提示 */ }
+    g_pd3dDevice->CreatePixelShader(pBlurPSBlob->GetBufferPointer(), pBlurPSBlob->GetBufferSize(), nullptr, &g_pBlurPixelShader);
+    pBlurPSBlob->Release();
+
+    // 3. 创建模糊专用的常量缓冲区 (16字节)
+    D3D11_BUFFER_DESC blurBd = {};
+    blurBd.Usage = D3D11_USAGE_DEFAULT;
+    blurBd.ByteWidth = 16; // float2 + padding = 16 bytes
+    blurBd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    g_pd3dDevice->CreateBuffer(&blurBd, nullptr, &g_pBlurConstantBuffer);
+
+
     // 4. 创建纹理采样器 (告诉显卡怎么读取这张图)
     D3D11_SAMPLER_DESC sampDesc = {};
     sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -324,17 +372,25 @@ bool InitDX11(HWND hWnd) {
     g_pd3dDevice->CreateSamplerState(&sampDesc, &g_pShadowSampler);
 
     // 加载 PBR 贴图
-    LoadTextureToDX11("rock_albedo.jpg", &g_pAlbedoSRV);
-    LoadTextureToDX11("rock_normal.jpg", &g_pNormalSRV);
+    LoadTextureToDX11("rock_albedo.jpg", &g_pRockAlbedoSRV);
+    LoadTextureToDX11("rock_normal.jpg", &g_pRockNormalSRV);
+    LoadTextureToDX11("grass_albedo.jpg", &g_pGrassAlbedoSRV);
+    LoadTextureToDX11("grass_normal.jpg", &g_pGrassNormalSRV);
+    LoadTextureToDX11("snow_albedo.jpg", &g_pSnowAlbedoSRV);
+    LoadTextureToDX11("snow_normal.jpg", &g_pSnowNormalSRV);
 
     // 创建 Wrap 采样器 (地形贴图必须允许平铺重复 D3D11_TEXTURE_ADDRESS_WRAP)
     D3D11_SAMPLER_DESC wrapDesc = {};
-    wrapDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    wrapDesc.Filter = D3D11_FILTER_ANISOTROPIC; // 【开启各向异性过滤】
+    wrapDesc.MaxAnisotropy = 16;                // 【最高质量 16x】
     wrapDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
     wrapDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
     wrapDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
     wrapDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    wrapDesc.MinLOD = 0;                        // 允许使用最清晰的 Mip
+    wrapDesc.MaxLOD = D3D11_FLOAT32_MAX;        // 允许使用最模糊的 Mip
     g_pd3dDevice->CreateSamplerState(&wrapDesc, &g_pWrapSampler);
+
 
     return true;
 }
@@ -379,7 +435,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             // --- 每一帧的更新与渲染 ---
 
            // A. 让 CUDA 去算新地形
-            g_TerrainSystem.Update(dt);
+            // 【核心修改】不要传 dt 了，把玩家真实的绝对坐标传给地形系统！
+            // 地形系统会根据玩家的坐标，自动算出需要丢弃哪些旧区块，并在后台调用 CUDA 生成哪些新区块
+            g_TerrainSystem.Update(g_camPos.x, g_camPos.z);
 
             // ==========================================
             // 每帧开始：提前算好两套矩阵和动态太阳
@@ -442,22 +500,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV4, 800.0f / 600.0f, 0.01f, 1000.0f);
             XMMATRIX playerMatrix = view * proj;
 
-            // 2. 动态太阳矩阵
-            // 我们让太阳以地图中心 (100,100) 为圆心做环绕运动，并且高度发生起伏
-            float sunX = 100.0f + cosf(sunAngle) * 150.0f;
-            float sunZ = 100.0f + sinf(sunAngle) * 150.0f;
-            float sunY = 150.0f + sinf(sunAngle * 0.5f) * 80.0f; // 高度在 70 到 230 之间起伏，阴影会拉长缩短！
+            // 2. 动态太阳矩阵 (开放世界跟踪版)
+            // 获取玩家当前的绝对坐标
+            float px = XMVectorGetX(pos); // 这里的 pos 是你之前算的摄像机位置
+            float pz = XMVectorGetZ(pos);
+
+            // 让太阳永远以玩家为中心进行环绕，并且拉远距离防止穿模
+            float sunDistance = 800.0f; // 太阳到玩家的水平距离
+            float sunX = px + cosf(sunAngle) * sunDistance;
+            float sunZ = pz + sinf(sunAngle) * sunDistance;
+            float sunY = 600.0f + sinf(sunAngle * 0.5f) * 200.0f; // 抬高太阳，防止被远处的极高山峰挡住光线截断阴影
 
             XMVECTOR LightPos = XMVectorSet(sunX, sunY, sunZ, 0.0f);
-            XMVECTOR LightTarget = XMVectorSet(100.0f, 0.0f, 100.0f, 0.0f);
+            XMVECTOR LightTarget = XMVectorSet(px, 0.0f, pz, 0.0f); // 核心：太阳永远盯着玩家的脚下！
             XMMATRIX lightView = XMMatrixLookAtLH(LightPos, LightTarget, XMVectorSet(0, 1, 0, 0));
-            XMMATRIX lightProj = XMMatrixOrthographicLH(200.0f, 200.0f, 1.0f, 500.0f);
+
+            // 【核爆点】把 200 米的视界扩大到 1200 米！Z轴深度也拉长到 2000 米包住所有大山！
+            XMMATRIX lightProj = XMMatrixOrthographicLH(1200.0f, 1200.0f, 1.0f, 2000.0f);
             XMMATRIX sunMatrix = lightView * lightProj;
 
-            // 3. 【关键新增】算出一个从地形“指向太阳”的向量，传给 Shader！
-            float dirX = sunX - 100.0f;
+            // 3. 算出一个从地形“指向太阳”的向量，传给 Shader！
+            float dirX = sunX - px;
             float dirY = sunY - 0.0f;
-            float dirZ = sunZ - 100.0f;
+            float dirZ = sunZ - pz;
             float len = sqrtf(dirX * dirX + dirY * dirY + dirZ * dirZ);
             XMFLOAT4 lightDir = XMFLOAT4(dirX / len, dirY / len, dirZ / len, 0.0f); // 归一化
 
@@ -500,7 +565,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             // 【新增这一行】Eye 就是你在上面定义的 XMVECTOR 摄像机位置
             cbMain.CameraPos = XMFLOAT4(XMVectorGetX(Eye), XMVectorGetY(Eye), XMVectorGetZ(Eye), 1.0f);
             // 【新增这一行】强行注入天气状态！0.0f 是极度干燥，1.0f 是汪洋大海
-            cbMain.WeatherParams = XMFLOAT4(0.85f, 0.0f, 0.0f, 0.0f);
+            cbMain.WeatherParams = XMFLOAT4(0.4f, 0.0f, 0.0f, 0.0f);
             // 【新增这几行】注入时间！dt 是帧间隔，totalTime 是累积时间
             static float totalTime = 0.0f;
             totalTime += dt;
@@ -508,6 +573,61 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
             g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, nullptr, &cbMain, 0, 0);
 
+
+
+            // ==========================================
+            // 【新增】PASS 1.5：VSM 高斯模糊 (乒乓操作)
+            // ==========================================
+
+            // 我们复用天空盒那个神奇的“全屏三角形”魔法，不需要传定点数据
+            g_pImmediateContext->IASetInputLayout(nullptr);
+            g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_pImmediateContext->VSSetShader(g_pSkyVertexShader, nullptr, 0); // 借用天空盒的 VS 画全屏三角形
+            g_pImmediateContext->PSSetShader(g_pBlurPixelShader, nullptr, 0);
+            g_pImmediateContext->PSSetSamplers(0, 1, &g_pShadowSampler); // 绑定采样器
+
+            // 关闭深度测试 (全屏模糊不需要 Z 缓冲)
+            g_pImmediateContext->OMSetDepthStencilState(g_pSkyDepthState, 0);
+
+            struct BlurParams {
+                float dirX, dirY, pad1, pad2;
+            };
+            BlurParams bp;
+            float shadowResolution = 2048.0f;
+
+            // --- 第一回合：水平模糊 ---
+            // 目标画板设为备用图 g_pVSMBlurRTV，读取刚画好的 g_pVSMSRV
+            g_pImmediateContext->OMSetRenderTargets(1, &g_pVSMBlurRTV, nullptr);
+            g_pImmediateContext->PSSetShaderResources(0, 1, &g_pVSMSRV);
+
+            bp = { 1.0f / shadowResolution, 0.0f, 0.0f, 0.0f }; // X方向步长
+            g_pImmediateContext->UpdateSubresource(g_pBlurConstantBuffer, 0, nullptr, &bp, 0, 0);
+            g_pImmediateContext->PSSetConstantBuffers(1, 1, &g_pBlurConstantBuffer); // 注意这里绑定到插槽 b1
+
+            g_pImmediateContext->Draw(3, 0); // 发射！
+
+            // 必须解绑 SRV，否则 DX11 会警告“资源正在被用作渲染目标”          
+            g_pImmediateContext->PSSetShaderResources(0, 1, &nullSRV);
+
+            // --- 第二回合：垂直模糊 ---
+            // 目标画板切回原本的 g_pVSMRTV，读取刚才水平模糊完的 g_pVSMBlurSRV
+            g_pImmediateContext->OMSetRenderTargets(1, &g_pVSMRTV, nullptr);
+            g_pImmediateContext->PSSetShaderResources(0, 1, &g_pVSMBlurSRV);
+
+            bp = { 0.0f, 1.0f / shadowResolution, 0.0f, 0.0f }; // Y方向步长
+            g_pImmediateContext->UpdateSubresource(g_pBlurConstantBuffer, 0, nullptr, &bp, 0, 0);
+            g_pImmediateContext->PSSetConstantBuffers(1, 1, &g_pBlurConstantBuffer);
+
+            g_pImmediateContext->Draw(3, 0); // 发射！
+
+            // 再次解绑清理
+            g_pImmediateContext->PSSetShaderResources(0, 1, &nullSRV);
+
+            // 恢复正常的深度缓冲状态，准备进入 PASS 2
+            g_pImmediateContext->OMSetDepthStencilState(nullptr, 0);
+            g_pImmediateContext->IASetInputLayout(g_pVertexLayout);
+
+        
 
             // ==========================================
             // PASS 2：玩家的视界 (真正的带光影渲染)
@@ -548,9 +668,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             g_pImmediateContext->PSSetSamplers(0, 1, &g_pShadowSampler);
             g_pImmediateContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
 
-            //岩石法线和基础色贴图
-            ID3D11ShaderResourceView* srvs[] = { g_pVSMSRV, g_pAlbedoSRV, g_pNormalSRV }; // t0, t1, t2
-            g_pImmediateContext->PSSetShaderResources(0, 3, srvs);
+            // 把pbr贴图一块上传给 PS
+            ID3D11ShaderResourceView* srvs[] = {
+                g_pVSMSRV,          // t0: 阴影图
+                g_pRockAlbedoSRV,   // t1: 岩石色
+                g_pRockNormalSRV,   // t2: 岩石法线
+                g_pGrassAlbedoSRV,  // t3: 草地色
+                g_pGrassNormalSRV,  // t4: 草地法线
+                g_pSnowAlbedoSRV,   // t5: 雪地色
+                g_pSnowNormalSRV    // t6: 雪地法线
+            };
+            g_pImmediateContext->PSSetShaderResources(0, 7, srvs);
+
             ID3D11SamplerState* samplers[] = { g_pShadowSampler, g_pWrapSampler }; // s0, s1
             g_pImmediateContext->PSSetSamplers(0, 2, samplers);
 

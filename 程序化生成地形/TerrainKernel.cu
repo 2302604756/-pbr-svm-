@@ -75,7 +75,7 @@ __device__ float CalculateHeight(float x, float z) {
     float amplitude = 1.0f;
     float frequency = 0.05f;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 20; i++) {
         // 山脊噪声: 1.0 - abs(noise * 2 - 1) 产生刀劈般的山峰    
         //float n = noise2D(nx * frequency, nz * frequency) * 2.0f - 1.0f;
        // n = 1.0f - fabsf(n);
@@ -90,7 +90,7 @@ __device__ float CalculateHeight(float x, float z) {
 
     // 4. 融合组装
     float groundLevel = 5.0f;         // 盆地基础海拔
-    float maxMountainHeight = 40.0f;  // 山脉最高隆起
+    float maxMountainHeight = 60.0f;  // 山脉最高隆起
 
     return groundLevel + (fbmNoise * mountainMask * maxMountainHeight);
 }
@@ -146,82 +146,59 @@ __device__ float3 CalculateNormal(float x, float z) {
 //第一个参数：输入顶点数组的指针
 //第二个参数：网格大小
 //第三个参数：时间偏移量，用于控制错觉的飞行速度
-__global__ void GenerateTerrainKernel(TerrainVertex* vertices, int gridSize, float offsetZ) {
+// ... 顶部的法线和高度函数不变 ...
+
+// ==========================================
+// CUDA 核心：绝对坐标生成
+// ==========================================
+__global__ void GenerateTerrainKernel(TerrainVertex* vertices, int gridSize, float worldOffsetX, float worldOffsetZ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int z = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= gridSize - 1 || z >= gridSize - 1) return;
 
     int index = (z * (gridSize - 1) + x) * 6;
-    float spacing = 1.5f; // 网格间距
+    float spacing = 1.5f;
 
-    // ==========================================
-    // 核心黑魔法：履带式滚动 (Treadmill)
-    // 彻底消灭 Low-Poly 的波浪蠕动形变！
-    // ==========================================
+    // 【核心】网格局部坐标 + 传入的世界起始点偏移量
+    float sampleX = (float)x * spacing + worldOffsetX;
+    float sampleZ = (float)z * spacing + worldOffsetZ;
 
-    // 1. 计算当前平滑滑动了多少距离 (永远在 0 到 1.5 之间循环)
-    float shiftZ = fmodf(offsetZ, spacing);
-
-    // 2. 计算当前进位了多少个完整的格子 (跳跃式的整数倍)
-    float baseSampleZ = floorf(offsetZ / spacing) * spacing;
-
-    // 3. 物理坐标：让三角形真正地在空间中向摄像机平滑滑动！
-    float meshX = (float)x * spacing;
-    float meshZ = (float)z * spacing - shiftZ;
-
-    // 4. 采样坐标：只在网格“履带重置”的那一瞬间发生整格跳跃。
-    // 这保证了物理顶点永远死死锁在山脉特征上，绝对不会形变！
-    // ... 履带算法前面部分不变 ...
-    float sampleX = (float)x * spacing;
-    float sampleZ = (float)z * spacing + baseSampleZ;
-
-    // 1. 算高度
     float y00 = CalculateHeight(sampleX, sampleZ);
     float y10 = CalculateHeight(sampleX + spacing, sampleZ);
     float y01 = CalculateHeight(sampleX, sampleZ + spacing);
     float y11 = CalculateHeight(sampleX + spacing, sampleZ + spacing);
 
-    // 2. 算法线 (新增！)
     float3 n00 = CalculateNormal(sampleX, sampleZ);
     float3 n10 = CalculateNormal(sampleX + spacing, sampleZ);
     float3 n01 = CalculateNormal(sampleX, sampleZ + spacing);
     float3 n11 = CalculateNormal(sampleX + spacing, sampleZ + spacing);
 
-    // 3. 算 UV 纹理坐标 (新增！)
-    // 假设一张贴图覆盖 20 米的范围，通过除以 20.0f 来控制贴图的缩放比例 (Tiling)
     float uvScale = 20.0f;
     float2 uv00 = make_float2(sampleX / uvScale, sampleZ / uvScale);
     float2 uv10 = make_float2((sampleX + spacing) / uvScale, sampleZ / uvScale);
     float2 uv01 = make_float2(sampleX / uvScale, (sampleZ + spacing) / uvScale);
     float2 uv11 = make_float2((sampleX + spacing) / uvScale, (sampleZ + spacing) / uvScale);
 
-    // 预先算好四个角的物理坐标
-    float mx0 = meshX; float mx1 = meshX + spacing;
-    float mz0 = meshZ; float mz1 = meshZ + spacing;
-
-    // 4. 装填顶点 (Position, Normal, UV)
-    auto setVertex = [&](int offset, float x, float y, float z, float3 n, float2 uv) {
-        vertices[index + offset].x = x; vertices[index + offset].y = y; vertices[index + offset].z = z;
+    // 绝对物理坐标装填
+    auto setVertex = [&](int offset, float vx, float vy, float vz, float3 n, float2 uv) {
+        vertices[index + offset].x = vx; vertices[index + offset].y = vy; vertices[index + offset].z = vz;
         vertices[index + offset].nx = n.x; vertices[index + offset].ny = n.y; vertices[index + offset].nz = n.z;
         vertices[index + offset].u = uv.x; vertices[index + offset].v = uv.y;
         };
 
-    setVertex(0, mx0, y00, mz0, n00, uv00);
-    setVertex(1, mx1, y10, mz0, n10, uv10);
-    setVertex(2, mx0, y01, mz1, n01, uv01);
+    setVertex(0, sampleX, y00, sampleZ, n00, uv00);
+    setVertex(1, sampleX + spacing, y10, sampleZ, n10, uv10);
+    setVertex(2, sampleX, y01, sampleZ + spacing, n01, uv01);
 
-    setVertex(3, mx0, y01, mz1, n01, uv01);
-    setVertex(4, mx1, y10, mz0, n10, uv10);
-    setVertex(5, mx1, y11, mz1, n11, uv11);
+    setVertex(3, sampleX, y01, sampleZ + spacing, n01, uv01);
+    setVertex(4, sampleX + spacing, y10, sampleZ, n10, uv10);
+    setVertex(5, sampleX + spacing, y11, sampleZ + spacing, n11, uv11);
 }
 
-// 暴露给 C++ 的调用接口
-extern "C" void LaunchTerrainKernel(TerrainVertex* d_vertices, int gridSize, float offsetZ) {
+extern "C" void LaunchTerrainKernel(TerrainVertex* d_vertices, int gridSize, float worldOffsetX, float worldOffsetZ) {
     dim3 blockSize(16, 16);
-    dim3 gridSizeDim((gridSize + blockSize.x - 1) / blockSize.x,
-        (gridSize + blockSize.y - 1) / blockSize.y);
-
-    GenerateTerrainKernel << <gridSizeDim, blockSize >> > (d_vertices, gridSize, offsetZ);
+    dim3 gridSizeDim((gridSize + blockSize.x - 1) / blockSize.x, (gridSize + blockSize.y - 1) / blockSize.y);
+    GenerateTerrainKernel << <gridSizeDim, blockSize >> > (d_vertices, gridSize, worldOffsetX, worldOffsetZ);
     cudaDeviceSynchronize();
 }
