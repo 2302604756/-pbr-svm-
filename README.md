@@ -8,6 +8,6 @@ FinalColor = waterColor*(1-transmittance)+underWaterColor*transmittance
 3.做了贴图混合效果，通过高度，坡度等来控制草地，水体，雪地，岩石贴图的混合  
 4.新加了小demo动画(还很简陋)  
 
+https://github.com/user-attachments/assets/dfd41857-c09c-4986-8ccd-4d3f7fe39715
 
-https://github.com/user-attachments/assets/6f2d781e-b9d8-4879-80f1-e122b2b3e816
 
