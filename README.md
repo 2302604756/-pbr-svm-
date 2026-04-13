@@ -5,6 +5,7 @@
 使用了水体与杂质分离的方法利用水体与杂质吸收系数Extinction不同  
 通过浑浊度turbidity来控制透射率transmittance实现finalcolor的能量守恒计算  
 FinalColor = waterColor*(1-transmittance)+underWaterColor*transmittance  
+并做了水面扰动效果  
 3.做了贴图混合效果，通过高度，坡度等来控制草地，水体，雪地，岩石贴图的混合  
 4.新加了小demo动画(还很简陋)  
 
