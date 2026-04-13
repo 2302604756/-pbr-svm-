@@ -5,7 +5,7 @@ cbuffer ConstantBuffer : register(b0)
 {
     matrix WorldViewProj;
     matrix LightViewProj;
-    matrix InvViewProj;
+    matrix InvViewProj; 
     float4 LightDirToSun;
     float4 CameraPos;
     float4 WeatherParams;
@@ -47,6 +47,9 @@ struct PS_INPUT
     float4 LightSpacePos : TEXCOORD0;
     float3 Normal : NORMAL;
     float2 UV : TEXCOORD1;
+    // 【核心新增：偷渡原始数据】
+    float OriginalY : TEXCOORD2; // 记住被拉平前的真实海拔
+    float3 OriginalNormal : TEXCOORD3; // 记住被拉平前的真实山体法线
 };
 
 // ------------------------------------------
@@ -56,15 +59,18 @@ PS_INPUT VS(VS_INPUT input)
 {
     PS_INPUT output;
     
-    // 【魔法：大禹治水】
-    float waterLevel = 12.0f;
-    float3 finalPos = input.Pos;
+    // 【核心新增：在拉平前，先录入档案】
+    output.OriginalY = input.Pos.y;
+    output.OriginalNormal = input.Normal;
     
-    // 强制拉平水底顶点，带有极小的防抖容差
+    // 【魔法：大禹治水】
+    float waterLevel = 25.0f; // 从 12.0f 改成 25.0f，或者你觉得好看的高度
+    float3 finalPos = input.Pos;
+
     if (finalPos.y <= waterLevel + 0.05f)
     {
         finalPos.y = waterLevel;
-        output.Normal = float3(0.0f, 1.0f, 0.0f); // 水平面宏观法线永远朝上
+        output.Normal = float3(0.0f, 1.0f, 0.0f);
     }
     else
     {
@@ -133,25 +139,30 @@ float2 ShadowPS(PS_INPUT input) : SV_Target
 // ==========================================
 float4 PS(PS_INPUT input) : SV_Target
 {
-    // ==========================================
-    // 1. 提取水面遮罩与净化法线
+   // ==========================================
+    // 1. 提取水面遮罩与净化法线 (同时抬高水位！)
     // ==========================================
     float height = input.WorldPos.y;
-    float waterLevel = 12.0f;
-    // 深水区强制设为1，防止极微小的光栅化插值误差引发网格自阴影
+    
+    // 【核心修复 1：抬高水位】
+    // 新的 CUDA 地形更雄伟，谷底海拔变高了，12.0f 的水已经被埋在地底下了！
+    // 我们把水位抬高到 25.0f，让水重新淹没盆地！
+    float waterLevel = 25.0f;
+    
     float waterMask = height <= (waterLevel + 0.02f) ? 1.0f : 1.0f - smoothstep(waterLevel + 0.02f, waterLevel + 0.5f, height);
 
     float3 vertexNormal = normalize(input.Normal);
     vertexNormal = normalize(lerp(vertexNormal, float3(0.0f, 1.0f, 0.0f), waterMask));
 
+    // 【核心修复 2：拯救崩溃的 TBN 矩阵！】
     float3 T = normalize(float3(1.0f, 0.0f, 0.0f) - vertexNormal * vertexNormal.x);
-    float3 B = cross(vertexNormal, T);
+    // 注意这里！必须是 normalize(cross(T, N))
+    float3 B = normalize(cross(T, vertexNormal));
     float3x3 TBN = float3x3(T, B, vertexNormal);
 
     // ==========================================
     // 2. 陆地生态 (程序化纹理混合 Splatting)
     // ==========================================
-    // A. 采样所有材质 (调整一下平铺比例)
     float2 rockUV = input.UV * 2.0f;
     float2 grassUV = input.UV * 4.0f;
     float2 snowUV = input.UV * 3.0f;
@@ -165,29 +176,38 @@ float4 PS(PS_INPUT input) : SV_Target
     float3 snowAlbedo = SnowAlbedoMap.Sample(WrapSampler, snowUV).rgb;
     float3 snowNormal = SnowNormalMap.Sample(WrapSampler, snowUV).xyz * 2.0f - 1.0f;
 
+    // 【核心修复 3：镇压法线贴图的噪点】
+    rockNormal.xy *= 0.3f;
+    rockNormal = normalize(rockNormal);
+    grassNormal.xy *= 0.3f;
+    grassNormal = normalize(grassNormal);
+    snowNormal.xy *= 0.2f;
+    snowNormal = normalize(snowNormal);
+
     // B. 计算生态权重
-    float slope = 1.0f - vertexNormal.y; // 坡度：0为平地，1为峭壁
+    float slope = 1.0f - input.OriginalNormal.y;
     
-    // 雪线带有噪声，看起来参差不齐更自然
+    // 【核心修复 4：推高雪线！】
+    // 你的截图全是白色，是因为新山脉随便都有 50 米高，超过了你之前写的 30.0f 雪线。
+    // 我们把雪线推高到 60 米以上，让山腰露出岩石和草地！
     float snowLineNoise = sin(input.WorldPos.x * 0.2f) * cos(input.WorldPos.z * 0.2f) * 4.0f;
-    float snowWeight = smoothstep(30.0f + snowLineNoise, 40.0f + snowLineNoise, height);
-    // 陡坡挂不住雪和土，裸露岩石
+    float snowWeight = smoothstep(60.0f + snowLineNoise, 75.0f + snowLineNoise, height);
+    
     float rockWeight = smoothstep(0.15f, 0.35f, slope);
-    // 剩下的平缓地带长满草
     float grassWeight = saturate(1.0f - snowWeight - rockWeight);
 
-    // 重新归一化权重，防止材质过曝
     float sumWeight = grassWeight + rockWeight + snowWeight;
     grassWeight /= sumWeight;
     rockWeight /= sumWeight;
     snowWeight /= sumWeight;
 
-    // C. 执行混合
     float3 finalLandAlbedo = (grassAlbedo * grassWeight) + (rockAlbedo * rockWeight) + (snowAlbedo * snowWeight);
-    float3 finalLandNormal = (grassNormal * grassWeight) + (rockNormal * rockWeight) + (snowNormal * snowWeight);
-    float finalLandRoughness = (0.8f * grassWeight) + (0.65f * rockWeight) + (0.4f * snowWeight);
+    float3 finalLandNormal = normalize((grassNormal * grassWeight) + (rockNormal * rockWeight) + (snowNormal * snowWeight));
+    
+    // 【核心修复 5：调高粗糙度，吸收高频闪烁】
+    float finalLandRoughness = (0.8f * grassWeight) + (0.85f * rockWeight) + (0.7f * snowWeight);
     float3 finalLandF0 = float3(0.04f, 0.04f, 0.04f);
-
+    
     // D. 动态天气拦截站 (只对陆地生效)
     float globalWetness = WeatherParams.x;
 
@@ -216,23 +236,54 @@ float4 PS(PS_INPUT input) : SV_Target
     float3 flowingTangentNormal = RockNormalMap.Sample(WrapSampler, flowingUV).xyz * 2.0f - 1.0f;
     finalLandNormal = lerp(finalLandNormal, flowingTangentNormal, slopeMask * globalWetness * 0.5f);
 
-    // ==========================================
-    // 3. 海洋魔法材质 (双层法线滚动)
-    // ==========================================
-    float3 waterAlbedo = float3(0.015f, 0.06f, 0.12f); // 湖水蓝
-    float waterRoughness = 0.02f; // 镜面
+   // ==========================================
+// 3. 海洋透射与焦散 (PBR 改进版)
+// ==========================================
+// 1. 算真实水深
+    float trueWaterDepth = max(0.0f, waterLevel - input.OriginalY);
+
+// 2. [关键修正] 定义双介质的吸收系数
+// 纯水：吸收红光(0.35)，保留蓝光(0.01) -> 蓝绿色
+    float3 waterExtinction = float3(0.35f, 0.05f, 0.01f);
+// 泥沙杂质：强烈吸收蓝光(0.4)和绿光(0.1)，保留红光(0.02) -> 黄褐色
+    float3 dirtExtinction = float3(0.02f, 0.1f, 0.4f);
+
+    float turbidity = 0.0f; // 浑浊度现在只控制“泥沙”的浓度
+
+// 3. 混合总衰减系数
+// 水体永远存在，而泥沙随着浑浊度增加而增加
+    float3 totalExtinction = waterExtinction + dirtExtinction * turbidity;
+
+// 4. 计算透射率
+    float3 transmittance = exp(-4 *trueWaterDepth * totalExtinction);
+
+// 5. 水底画面透射 (海底颜色 + 焦散)
+// 如果水很浑浊，totalExtinction 的 B 通道会很大，蓝光透射率为 0
+// 这时光打到水底反射上来，就会呈现浑浊的黄绿色或泥浆色，绝不会变蓝！
+    float3 underwaterColor = (finalLandAlbedo + finalLandAlbedo) * transmittance;
+
+// 6. 体积光近似 (In-scattering)
+// 这里也需要根据浑浊度混合原本的深水蓝和泥浆色，让散射出的体积光也匹配水质
+    float3 deepWaterColor = float3(0.015f, 0.05f, 0.12f);
+    float3 muddyWaterColor = float3(0.2f, 0.15f, 0.05f); // 泥浆本色
+    float3 currentVolumeColor = lerp(deepWaterColor, muddyWaterColor, saturate(turbidity * 0.2f));
+
+    float3 waterVolumeColor = currentVolumeColor * (1.0f - transmittance);
+
+// 7. 最终合成
+    float3 waterAlbedo = underwaterColor + waterVolumeColor;
+// 粗糙度与F0保持不变
+    float waterRoughness = 0.02f;
     float3 waterF0 = float3(0.02f, 0.02f, 0.02f);
 
+    // 双层法线滚动 (保持你原来的代码)
     float2 waterUV = input.WorldPos.xz * 0.04f;
     float2 scroll1 = waterUV + float2(Time * 0.02f, Time * 0.015f);
     float2 scroll2 = waterUV * 1.5f + float2(-Time * 0.025f, Time * 0.01f);
-
-    // 借用 RockNormalMap 的高频噪声来做水波，不仅省内存效果还极度自然！
     float3 normal1 = RockNormalMap.Sample(WrapSampler, scroll1).xyz * 2.0f - 1.0f;
     float3 normal2 = RockNormalMap.Sample(WrapSampler, scroll2).xyz * 2.0f - 1.0f;
-
     float3 waveNormal = normal1 + normal2;
-    waveNormal.xy *= 0.15f; // 波浪强度
+    waveNormal.xy *= 0.15f;
     waveNormal.z = 1.0f;
     waveNormal = normalize(waveNormal);
 
@@ -247,7 +298,9 @@ float4 PS(PS_INPUT input) : SV_Target
     // ==========================================
     // 5. 光照计算 (PBR & VSM)
     // ==========================================
+    
     float3 N = normalize(mul(tangentNormal, TBN));
+    
     float3 V = normalize(CameraPos.xyz - input.WorldPos);
     float3 L = normalize(LightDirToSun.xyz);
     float3 H = normalize(V + L);
@@ -260,7 +313,7 @@ float4 PS(PS_INPUT input) : SV_Target
     if (projCoords.x >= 0.0f && projCoords.x <= 1.0f && projCoords.y >= 0.0f && projCoords.y <= 1.0f && projCoords.z >= 0.0f)
     {
         float2 moments = ShadowMap.Sample(Sampler, projCoords.xy).rg;
-        float currentDepth = projCoords.z;
+        float currentDepth = projCoords.z ;
         
         // Depth Bias (深度偏移)：完美过滤自发网格阴影，接收高山阴影
         float bias = 0.0005f;
@@ -310,6 +363,8 @@ float4 PS(PS_INPUT input) : SV_Target
     color = color / (color + float3(1.0f, 1.0f, 1.0f));
     color = pow(color, float3(1.0f / 2.2f, 1.0f / 2.2f, 1.0f / 2.2f));
 
+    color = smoothstep(0.0f, 1.0f, color);
+    
     return float4(color, 1.0f);
 }
 

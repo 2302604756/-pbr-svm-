@@ -26,10 +26,12 @@ struct TerrainChunk {
 
 // 外部 CUDA 函数 (注意参数变成了 worldOffsetX 和 worldOffsetZ)
 extern "C" void LaunchTerrainKernel(TerrainVertex* d_vertices, int gridSize, float worldOffsetX, float worldOffsetZ);
+// 【新增】云层生成核函数声明
+extern "C" void LaunchCloudGenKernel(cudaSurfaceObject_t surface, int volumeSize);
 
 class TerrainInteropManager {
 private:
-    const int GRID_SIZE = 128;            // 每个 Chunk 128x128 个顶点 (太大容易卡顿)
+    const int GRID_SIZE = 256;            // 每个 Chunk 128x128 个顶点 (太大容易卡顿)
     const float SPACING = 1.5f;           // 顶点间距
     const float CHUNK_SIZE = (GRID_SIZE - 1) * SPACING; // 单个 Chunk 的物理边长 = 190.5 米
     const int VIEW_DISTANCE = 2;          // 渲染半径 (2 代表 5x5 = 25 个区块)
@@ -163,4 +165,39 @@ public:
         }
         m_activeChunks.clear();
     }
+    // ==========================================
+    // 【新增】云层更新函数 (接受 main.cpp 传来的句柄)
+    // ==========================================
+    void UpdateCloudVolume(cudaGraphicsResource_t cloudCudaRes) {
+        // 安全检查：防止传入空指针导致 CUDA 崩溃
+        if (!cloudCudaRes) return;
+
+        // 1. 映射资源，告诉 DX11：“先别动这张图，CUDA 要动笔了”
+        cudaGraphicsMapResources(1, &cloudCudaRes, 0);
+
+        // 2. 获取 CUDA 内部的高级数组结构 (cudaArray)
+        cudaArray_t cuArray;
+        cudaGraphicsSubResourceGetMappedArray(&cuArray, cloudCudaRes, 0, 0);
+
+        // 3. 把这个数组包装成一个 "Surface Object" (表面对象)
+        cudaResourceDesc resDesc = {};
+        resDesc.resType = cudaResourceTypeArray;
+        resDesc.res.array.array = cuArray;
+
+        cudaSurfaceObject_t surfaceObj = 0;
+        cudaCreateSurfaceObject(&surfaceObj, &resDesc);
+
+        // 4. 发射 CUDA 核函数！
+        // 假设你的 3D 尺寸是 128x128x128，我们切成 8x8x8 的线程块
+        dim3 blockSize(8, 8, 8);
+        dim3 gridSize(128 / 8, 128 / 8, 128 / 8);
+
+        // 调用顶部的 extern "C" 函数
+        LaunchCloudGenKernel(surfaceObj, 128);
+
+        // 5. 卸磨杀驴，销毁 Surface，解绑映射，把控制权还给 DX11
+        cudaDestroySurfaceObject(surfaceObj);
+        cudaGraphicsUnmapResources(1, &cloudCudaRes, 0);
+    }
 };
+

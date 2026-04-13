@@ -61,6 +61,12 @@ ID3D11ShaderResourceView* g_pVSMBlurSRV = nullptr;// 读模糊图的眼镜
 ID3D11PixelShader* g_pBlurPixelShader = nullptr;
 ID3D11Buffer* g_pBlurConstantBuffer = nullptr;    // 用来传 BlurDir
 
+
+// 全局变量区：体积云专属装备
+ID3D11Texture3D* g_pCloudVolumeTex = nullptr;        // DX11 的 3D 画布
+ID3D11ShaderResourceView* g_pCloudVolumeSRV = nullptr; // 给 SkyShader 读云的 3D 眼镜 (t8)
+cudaGraphicsResource_t g_cudaCloudVolumeRes = nullptr; // CUDA 的映射句柄
+
 // ==========================================
 // 【新增】自由摄像机状态
 // ==========================================
@@ -391,6 +397,47 @@ bool InitDX11(HWND hWnd) {
     wrapDesc.MaxLOD = D3D11_FLOAT32_MAX;        // 允许使用最模糊的 Mip
     g_pd3dDevice->CreateSamplerState(&wrapDesc, &g_pWrapSampler);
 
+    // ==========================================
+// 初始化体积云 3D 纹理 (128x128x128)
+// ==========================================
+    int cloudVolSize = 128; // 128^3 = 200万个体素，对于现代显卡毫无压力
+
+    D3D11_TEXTURE3D_DESC tex3DDesc = {};
+    tex3DDesc.Width = cloudVolSize;
+    tex3DDesc.Height = cloudVolSize;
+    tex3DDesc.Depth = cloudVolSize;
+    tex3DDesc.MipLevels = 1;
+    tex3DDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // R,G,B,A 各8位，映射到 0.0~1.0
+    tex3DDesc.Usage = D3D11_USAGE_DEFAULT;
+    // 注意：只需绑为 ShaderResource 供 DX11 读，因为写入全靠 CUDA！
+    tex3DDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    // 1. 创建 DX11 3D 纹理
+    HRESULT hrCloud = g_pd3dDevice->CreateTexture3D(&tex3DDesc, nullptr, &g_pCloudVolumeTex);
+    if (FAILED(hrCloud)) {
+        MessageBoxA(NULL, "创建 3D 云层纹理失败！", "Error", MB_OK);
+        return false;
+    }
+
+    // 2. 创建 SRV (把 3D 眼镜做出来)
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv3DDesc = {};
+    srv3DDesc.Format = tex3DDesc.Format;
+    srv3DDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+    srv3DDesc.Texture3D.MostDetailedMip = 0;
+    srv3DDesc.Texture3D.MipLevels = 1;
+    g_pd3dDevice->CreateShaderResourceView(g_pCloudVolumeTex, &srv3DDesc, &g_pCloudVolumeSRV);
+
+    // 3. 【极其关键】注册到 CUDA，必须带有 SurfaceLoadStore 标记！
+    // 只有加了这个标记，CUDA 才知道你要对 3D 贴图进行像素级的读写操作。
+    cudaError_t cuErr = cudaGraphicsD3D11RegisterResource(
+        &g_cudaCloudVolumeRes,
+        g_pCloudVolumeTex,
+        cudaGraphicsRegisterFlagsSurfaceLoadStore // 魔法标记！
+    );
+    if (cuErr != cudaSuccess) {
+        MessageBoxA(NULL, "CUDA 映射 3D 纹理失败！", "Error", MB_OK);
+        return false;
+    }
 
     return true;
 }
@@ -407,6 +454,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     // 3. 【核心】初始化我们上一轮写的 CUDA 地形系统！
     g_TerrainSystem.Initialize(g_pd3dDevice);
+    // 在进入游戏主循环前，生成一次静态的体积云数据
+    g_TerrainSystem.UpdateCloudVolume(g_cudaCloudVolumeRes);
 
 // 高度拉升到 100，往后退一点，看向更深处的 Z=150
     XMVECTOR Eye = XMVectorSet(100.0f, 100.0f, -30.0f, 0.0f);
