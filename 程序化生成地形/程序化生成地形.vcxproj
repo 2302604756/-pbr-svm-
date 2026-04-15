@@ -83,6 +83,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="stb_image.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="shader.hlsl">
@@ -90,6 +91,12 @@
     </None>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Camera.h" />
+    <ClInclude Include="Environment.h" />
+    <ClInclude Include="GraphicsDevice.h" />
+    <ClInclude Include="RenderData.h" />
+    <ClInclude Include="RenderGraph.h" />
+    <ClInclude Include="RenderPipeline.h" />
     <ClInclude Include="stb_image.h" />
     <ClInclude Include="TerrainInteropManager.h" />
   </ItemGroup>

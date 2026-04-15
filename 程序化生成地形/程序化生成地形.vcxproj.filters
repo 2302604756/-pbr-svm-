@@ -5,6 +5,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="stb_image.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Filter Include="shaders">
@@ -14,6 +15,12 @@
   <ItemGroup>
     <ClInclude Include="TerrainInteropManager.h" />
     <ClInclude Include="stb_image.h" />
+    <ClInclude Include="GraphicsDevice.h" />
+    <ClInclude Include="RenderData.h" />
+    <ClInclude Include="Camera.h" />
+    <ClInclude Include="Environment.h" />
+    <ClInclude Include="RenderPipeline.h" />
+    <ClInclude Include="RenderGraph.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="shader.hlsl">
