@@ -1,7 +1,7 @@
 // ==========================================
 // 1. C++ 通信包裹 (常量缓冲区)
 // ==========================================
-cbuffer ConstantBuffer : register(b0)
+cbuffer SceneCB : register(b0)
 {
     matrix WorldViewProj;
     matrix LightViewProj;

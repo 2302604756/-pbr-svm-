@@ -1,5 +1,4 @@
 #pragma once
-#pragma once
 #include <d3d12.h>
 #include <wrl/client.h>
 #include <string>
@@ -29,18 +28,29 @@ struct RGPhysicalResource {
     D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle{ 0 };
     D3D12_CPU_DESCRIPTOR_HANDLE RTVHandle{ 0 };
     D3D12_CPU_DESCRIPTOR_HANDLE DSVHandle{ 0 };
+    UINT SRVOffset = 0;   // SRV 在 SRV 堆中的偏移（用于计算 GPU 句柄）
 };
 
-// 3. DX12 注册机：Execute 阶段供 Pass 获取 SRV/RTV/DSV 的 CPU 句柄
+// 3. DX12 注册机：Execute 阶段供 Pass 获取 SRV/RTV/DSV 句柄
 class RenderGraphRegistry {
     std::unordered_map<RGHandle, RGPhysicalResource>* m_resources;
+    D3D12_GPU_DESCRIPTOR_HANDLE m_srvHeapStartGPU{};
+    UINT m_srvDescriptorSize = 0;
 public:
-    RenderGraphRegistry(std::unordered_map<RGHandle, RGPhysicalResource>* res) : m_resources(res) {}
+    RenderGraphRegistry(std::unordered_map<RGHandle, RGPhysicalResource>* res,
+                        D3D12_GPU_DESCRIPTOR_HANDLE srvStart, UINT srvSize)
+        : m_resources(res), m_srvHeapStartGPU(srvStart), m_srvDescriptorSize(srvSize) {}
 
     ID3D12Resource* GetResource(RGHandle h) { return (*m_resources)[h].Resource.Get(); }
     D3D12_CPU_DESCRIPTOR_HANDLE GetSRV(RGHandle h) { return (*m_resources)[h].SRVHandle; }
     D3D12_CPU_DESCRIPTOR_HANDLE GetRTV(RGHandle h) { return (*m_resources)[h].RTVHandle; }
     D3D12_CPU_DESCRIPTOR_HANDLE GetDSV(RGHandle h) { return (*m_resources)[h].DSVHandle; }
+    // DX12 专用：把资源的 SRV 转成 GPU 可见句柄（绑定 Descriptor Table 用）
+    D3D12_GPU_DESCRIPTOR_HANDLE GetSRVGPU(RGHandle h) {
+        D3D12_GPU_DESCRIPTOR_HANDLE g;
+        g.ptr = m_srvHeapStartGPU.ptr + (UINT64)(*m_resources)[h].SRVOffset * m_srvDescriptorSize;
+        return g;
+    }
 };
 
 class RenderGraph;
@@ -65,14 +75,21 @@ struct RGResourceAccess {
     D3D12_RESOURCE_STATES DesiredState;
 };
 
-// 6. 图节点：Pass
+// 6. 编译期推导出的 Barrier：Handle 用于在 Execute 时解析资源指针
+//    （交换链 backbuffer 每帧变化，pResource 必须在执行期填充）
+struct RGBarrier {
+    RGHandle Handle;
+    D3D12_RESOURCE_BARRIER Barrier;
+};
+
+// 7. 图节点：Pass
 struct RGPassNode {
     std::string Name;
     std::vector<RGResourceAccess> Accesses; // 记录所有的资源访问偏好
     std::function<void(ID3D12GraphicsCommandList*, RenderGraphRegistry&)> ExecuteCallback;
 };
 
-// 7. DX12 渲染图主体
+// 8. DX12 渲染图主体
 class RenderGraph {
     friend class RenderGraphBuilder;
 private:
@@ -84,12 +101,18 @@ private:
     std::vector<RGPassNode> m_passes;
     std::vector<uint32_t> m_sortedPassIndices;
 
-    // 编译期推导出的屏障批次：m_passBarriers[sortedPassIdx] 存该 Pass 执行前需要提交的 Barrier 列表
-    std::vector<std::vector<D3D12_RESOURCE_BARRIER>> m_passBarriers;
+    // 编译期推导出的屏障批次：m_passBarriers[sortedPassIdx] 存该 Pass 执行前需要提交的 Barrier
+    std::vector<std::vector<RGBarrier>> m_passBarriers;
+
+    // SRV 堆信息（Execute 时计算 GPU 句柄）
+    D3D12_GPU_DESCRIPTOR_HANDLE m_srvHeapStartGPU{};
+    UINT m_srvDescriptorSize = 0;
 
 public:
     // 导入外部物理资源（如 SwapChain 当前帧 BackBuffer）
-    RGHandle ImportRenderTarget(const std::string& name, ID3D12Resource* pRes, D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle, D3D12_RESOURCE_STATES initialState) {
+    RGHandle ImportRenderTarget(const std::string& name, ID3D12Resource* pRes,
+                                D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle,
+                                D3D12_RESOURCE_STATES initialState) {
         RGHandle h = m_nextHandle++;
         RGPhysicalResource phys;
         phys.Resource = pRes;
@@ -98,6 +121,26 @@ public:
         m_physicalResources[h] = phys;
         m_resourceNames[h] = name;
         return h;
+    }
+
+    // 导入外部深度资源（如主屏幕的 DepthBuffer，供多个 Pass 按不同状态访问）
+    RGHandle ImportDepthTarget(const std::string& name, ID3D12Resource* pRes,
+                               D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle,
+                               D3D12_RESOURCE_STATES initialState) {
+        RGHandle h = m_nextHandle++;
+        RGPhysicalResource phys;
+        phys.Resource = pRes;
+        phys.DSVHandle = dsvHandle;
+        phys.CurrentState = initialState;
+        m_physicalResources[h] = phys;
+        m_resourceNames[h] = name;
+        return h;
+    }
+
+    // 每帧更新导入资源（SwapChain 每帧轮换 backbuffer：指针与 RTV 都要更新）
+    void UpdateImportedResource(RGHandle h, ID3D12Resource* pRes, D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = {}) {
+        m_physicalResources[h].Resource = pRes;
+        if (rtvHandle.ptr) m_physicalResources[h].RTVHandle = rtvHandle;
     }
 
     template<typename SetupFunc, typename ExecuteFunc>
@@ -114,13 +157,23 @@ public:
     }
 
     // 编译期：物理资源创建与自动 Barrier 推导
-    void Compile(ID3D12Device* device, ID3D12DescriptorHeap* rtvHeap, ID3D12DescriptorHeap* dsvHeap, ID3D12DescriptorHeap* srvHeap, UINT descriptorSizeRTV, UINT descriptorSizeDSV, UINT descriptorSizeSRV) {
-        // 1. 物理 VRAM 分配 (Committed Resource 示范，工业级可在此替换为 Placed Resource 堆复用)
-        UINT rtvOffset = 0, dsvOffset = 0, srvOffset = 0;
+    // base offsets：描述符堆中已由外部占用的偏移（backbuffer RTV、主深度 DSV、材质 SRV 等）
+    void Compile(ID3D12Device* device,
+                 ID3D12DescriptorHeap* rtvHeap, ID3D12DescriptorHeap* dsvHeap, ID3D12DescriptorHeap* srvHeap,
+                 UINT descriptorSizeRTV, UINT descriptorSizeDSV, UINT descriptorSizeSRV,
+                 UINT rtvBaseOffset = 0, UINT dsvBaseOffset = 0, UINT srvBaseOffset = 0) {
+        m_srvHeapStartGPU = srvHeap->GetGPUDescriptorHandleForHeapStart();
+        m_srvDescriptorSize = descriptorSizeSRV;
 
-        for (const auto& pair : m_virtualResources) {
-            RGHandle h = pair.first;
-            const RGTextureDesc& desc = pair.second;
+        // 1. 物理 VRAM 分配（按 handle 升序，保证描述符偏移确定）
+        std::vector<RGHandle> handles;
+        for (const auto& pair : m_virtualResources) handles.push_back(pair.first);
+        std::sort(handles.begin(), handles.end());
+
+        UINT rtvOffset = rtvBaseOffset, dsvOffset = dsvBaseOffset, srvOffset = srvBaseOffset;
+
+        for (RGHandle h : handles) {
+            const RGTextureDesc& desc = m_virtualResources[h];
 
             // 跳过已导入的外部资源
             if (m_physicalResources.find(h) != m_physicalResources.end()) continue;
@@ -150,13 +203,13 @@ public:
             RGPhysicalResource phys;
             phys.CurrentState = desc.IsDepthStencil ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
 
-            device->CreateCommittedResource(
-                &heapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
-                phys.CurrentState, &clearValue,
-                IID_PPV_ARGS(phys.Resource.GetAddressOf())
-            );
+            if (FAILED(device->CreateCommittedResource(
+                    &heapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
+                    phys.CurrentState, &clearValue,
+                    IID_PPV_ARGS(phys.Resource.GetAddressOf())))) {
+                continue;
+            }
 
-            // 简单切分描述符句柄 (生产环境建议接入专用 DescriptorAllocator)
             if (desc.IsDepthStencil) {
                 D3D12_DEPTH_STENCIL_VIEW_DESC dsvViewDesc = {};
                 dsvViewDesc.Format = DXGI_FORMAT_D32_FLOAT;
@@ -171,21 +224,23 @@ public:
                 srvViewDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                 srvViewDesc.Texture2D.MipLevels = 1;
 
-                phys.SRVHandle.ptr = srvHeap->GetCPUDescriptorHandleForHeapStart().ptr + (srvOffset++ * descriptorSizeSRV);
+                phys.SRVHandle.ptr = srvHeap->GetCPUDescriptorHandleForHeapStart().ptr + (srvOffset * descriptorSizeSRV);
+                phys.SRVOffset = srvOffset++;
                 device->CreateShaderResourceView(phys.Resource.Get(), &srvViewDesc, phys.SRVHandle);
             }
             else {
                 phys.RTVHandle.ptr = rtvHeap->GetCPUDescriptorHandleForHeapStart().ptr + (rtvOffset++ * descriptorSizeRTV);
                 device->CreateRenderTargetView(phys.Resource.Get(), nullptr, phys.RTVHandle);
 
-                phys.SRVHandle.ptr = srvHeap->GetCPUDescriptorHandleForHeapStart().ptr + (srvOffset++ * descriptorSizeSRV);
+                phys.SRVHandle.ptr = srvHeap->GetCPUDescriptorHandleForHeapStart().ptr + (srvOffset * descriptorSizeSRV);
+                phys.SRVOffset = srvOffset++;
                 device->CreateShaderResourceView(phys.Resource.Get(), nullptr, phys.SRVHandle);
             }
 
             m_physicalResources[h] = phys;
         }
 
-        // 2. 拓扑排序 (默认按添加顺序)
+        // 2. 拓扑排序 (默认按添加顺序；完整实现可在此接入 Kahn 算法)
         m_sortedPassIndices.clear();
         for (uint32_t i = 0; i < m_passes.size(); ++i) m_sortedPassIndices.push_back(i);
 
@@ -205,18 +260,20 @@ public:
 
             for (const auto& access : pass.Accesses) {
                 RGHandle h = access.Handle;
-                D3D12_RESOURCE_STATES desiredState = access.DesiredState;
-                D3D12_RESOURCE_STATES currentState = stateTracker[h];
+                D3D12_RESOURCE_STATES desiredState = access.DesiredState;   // 从 Accesses 中读取想要的状态
+                D3D12_RESOURCE_STATES currentState = stateTracker[h];       // 资源上一次用完以后的状态
 
                 if (currentState != desiredState) {
-                    D3D12_RESOURCE_BARRIER barrier = {};
-                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                    barrier.Transition.pResource = m_physicalResources[h].Resource.Get();
-                    barrier.Transition.StateBefore = currentState;
-                    barrier.Transition.StateAfter = desiredState;
-                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    RGBarrier rb;
+                    rb.Handle = h;
+                    rb.Barrier = {};
+                    rb.Barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    // pResource 留空：交换链 backbuffer 每帧变化，必须在 Execute 时解析
+                    rb.Barrier.Transition.StateBefore = currentState;
+                    rb.Barrier.Transition.StateAfter = desiredState;
+                    rb.Barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-                    m_passBarriers[sortedIdx].push_back(barrier);
+                    m_passBarriers[sortedIdx].push_back(rb);
 
                     // 更新跟踪器的状态，供下一个 Pass 继续推导
                     stateTracker[h] = desiredState;
@@ -227,16 +284,24 @@ public:
 
     // 运行时：按图自动发射 Barrier 并执行 Command List 录制
     void Execute(ID3D12GraphicsCommandList* cmdList) {
-        RenderGraphRegistry registry(&m_physicalResources);
+        RenderGraphRegistry registry(&m_physicalResources, m_srvHeapStartGPU, m_srvDescriptorSize);
 
         for (size_t sortedIdx = 0; sortedIdx < m_sortedPassIndices.size(); ++sortedIdx) {
             uint32_t passIdx = m_sortedPassIndices[sortedIdx];
             auto& pass = m_passes[passIdx];
 
-            // 1. 自动批处理刷入当前 Pass 所需的所有 Transition Barriers
+            // 1. 自动批处理刷入当前 Pass 所需的所有 Transition Barriers（延迟解析资源指针）
             const auto& barriers = m_passBarriers[sortedIdx];
             if (!barriers.empty()) {
-                cmdList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+                thread_local std::vector<D3D12_RESOURCE_BARRIER> resolved;
+                resolved.clear();
+                resolved.reserve(barriers.size());
+                for (const auto& rb : barriers) {
+                    D3D12_RESOURCE_BARRIER b = rb.Barrier;
+                    b.Transition.pResource = m_physicalResources[rb.Handle].Resource.Get();
+                    resolved.push_back(b);
+                }
+                cmdList->ResourceBarrier(static_cast<UINT>(resolved.size()), resolved.data());
             }
 
             // 2. 纯净录制该 Pass 的命令
@@ -253,6 +318,7 @@ private:
     }
 };
 
+// Builder 方法实现
 inline RGHandle RenderGraphBuilder::CreateTexture(const std::string& name, const RGTextureDesc& desc) {
     return m_graph->CreateResourceInternal(name, desc);
 }
@@ -262,44 +328,3 @@ inline void RenderGraphBuilder::Read(RGHandle handle, D3D12_RESOURCE_STATES expe
 inline void RenderGraphBuilder::Write(RGHandle handle, D3D12_RESOURCE_STATES expectedState) {
     m_graph->m_passes[m_passIndex].Accesses.push_back({ handle, expectedState });
 }
-
-
-
-RenderGraph rg;
-
-// 1. 导入 SwapChain 的渲染目标
-RGHandle backBuffer = rg.ImportRenderTarget("BackBuffer", currentSwapChainResource, currentRTVHandle, D3D12_RESOURCE_STATE_PRESENT);
-
-// 2. Main Pass
-RGHandle sceneColor;
-rg.AddPass("MainPass",
-    [&](RenderGraphBuilder& builder) {
-        sceneColor = builder.CreateTexture("SceneColor", { 1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, false });
-
-        // 显式声明：在此 Pass 中，SceneColor 要作为 RenderTarget 写入
-        builder.Write(sceneColor, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    },
-    [=](ID3D12GraphicsCommandList* cmdList, RenderGraphRegistry& registry) {
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = registry.GetRTV(sceneColor);
-        cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        // cmdList->DrawIndexedInstanced(...);
-    }
-);
-
-// 3. PostProcess Pass
-rg.AddPass("PostProcessPass",
-    [&](RenderGraphBuilder& builder) {
-        // 显式声明：在此 Pass 中，SceneColor 转换为 Pixel Shader 采样源
-        builder.Read(sceneColor, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        builder.Write(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    },
-    [=](ID3D12GraphicsCommandList* cmdList, RenderGraphRegistry& registry) {
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = registry.GetRTV(backBuffer);
-        cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        // 绑定 SceneColor 的 SRV 并画全屏 Fullscreen Triangle...
-    }
-);
-
-// 4. 编译与发射
-rg.Compile(device, rtvHeap, dsvHeap, srvHeap, rtvSize, dsvSize, srvSize);
-rg.Execute(commandList); // 自动在 Pass 之间吐出正确的 ResourceBarrier！

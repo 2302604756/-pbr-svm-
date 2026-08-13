@@ -1,7 +1,7 @@
 // ==========================================
 // 1. 绝对安全的 C++ 通信包裹
 // ==========================================
-cbuffer ConstantBuffer : register(b0)
+cbuffer SceneCB : register(b0)
 {
     matrix WorldViewProj;
     matrix LightViewProj;
