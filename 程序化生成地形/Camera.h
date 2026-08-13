@@ -7,7 +7,7 @@ using namespace DirectX;
 class Camera {
 public:
     XMFLOAT3 camPos;
-    float camYaw;
+    float camYaw; 
     float camPitch;
     POINT LastMousePos;
     bool isRMouseDragging;
@@ -56,6 +56,7 @@ public:
         XMStoreFloat3(&camPos, pos);
     }
 
+    //外部获取矩阵的接口
     XMMATRIX GetViewMatrix() const {
         XMVECTOR Eye = XMLoadFloat3(&camPos);
         XMVECTOR Forward = XMVectorSet(sinf(camYaw) * cosf(camPitch), -sinf(camPitch), cosf(camYaw) * cosf(camPitch), 0.0f);

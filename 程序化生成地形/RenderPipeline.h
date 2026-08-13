@@ -10,7 +10,7 @@
 class RenderPipeline {
 public:
     // =====================================
-    // 1. 成员变量声明 (绝对没改你的命名！)
+    // 1. 成员变量声明 
     // =====================================
     ComPtr<ID3D11VertexShader> pVertexShader;
     ComPtr<ID3D11PixelShader> pPixelShader;
@@ -18,6 +18,7 @@ public:
     ComPtr<ID3D11VertexShader> pSkyVertexShader;
     ComPtr<ID3D11PixelShader> pSkyPixelShader;
     ComPtr<ID3D11PixelShader> pBlurPixelShader;
+    ComPtr<ID3D11PixelShader> pEdgePixelShader; 
 
     ComPtr<ID3D11InputLayout> pVertexLayout;
     ComPtr<ID3D11Buffer> pConstantBuffer;
@@ -28,7 +29,7 @@ public:
     ComPtr<ID3D11SamplerState> pShadowSampler;
     ComPtr<ID3D11SamplerState> pWrapSampler;
 
-    // 材质与云层 (恢复了你熟悉的 SRV 后缀)
+    // 材质与云层 
     ComPtr<ID3D11ShaderResourceView> pRockAlbedoSRV;
     ComPtr<ID3D11ShaderResourceView> pRockNormalSRV;
     ComPtr<ID3D11ShaderResourceView> pGrassAlbedoSRV;
@@ -41,14 +42,14 @@ public:
     cudaGraphicsResource_t cudaCloudVolumeRes = nullptr;
 
     // =====================================
-    // 【新增】：将局部结构体改为类的成员变量，彻底解决 Lambda 捕获和生命周期问题！
+    //将局部结构体改为类的成员变量，彻底解决 Lambda 捕获和生命周期问题！
     // =====================================
     RGHandle m_hBackBuffer;
     RGHandle m_hRawVSM;
     RGHandle m_hShadowDepth;
     RGHandle m_hBlurX;
     RGHandle m_hFinalVSM;
-
+    RGHandle m_hSceneColor;  // 【新增】：用于保存整个场景颜色的虚拟画布
 
     // =====================================
     // 2. 贴图加载工具
@@ -80,10 +81,10 @@ public:
     }
 
     // =====================================
-    // 3. 完整的初始化 (没有任何省略)
+    // 3. 完整的初始化 
     // =====================================
     bool Initialize(GraphicsDevice& gfx) {
-        ComPtr<ID3DBlob> pVSBlob, pPSBlob, pShadowPSBlob, pBlurPSBlob, pSkyVSBlob, pSkyPSBlob, errorBlob;
+        ComPtr<ID3DBlob> pVSBlob, pPSBlob, pShadowPSBlob, pBlurPSBlob, pSkyVSBlob, pSkyPSBlob, errorBlob, pEdgePSBlob;
 
         // A. 编译 Shader
         D3DCompileFromFile(L"Shader.hlsl", nullptr, nullptr, "VS", "vs_5_0", 0, 0, pVSBlob.GetAddressOf(), errorBlob.GetAddressOf());
@@ -92,6 +93,7 @@ public:
         D3DCompileFromFile(L"Shader.hlsl", nullptr, nullptr, "BlurPS", "ps_5_0", 0, 0, pBlurPSBlob.GetAddressOf(), errorBlob.GetAddressOf());
         D3DCompileFromFile(L"SkyShader.hlsl", nullptr, nullptr, "VS", "vs_5_0", 0, 0, pSkyVSBlob.GetAddressOf(), errorBlob.GetAddressOf());
         D3DCompileFromFile(L"SkyShader.hlsl", nullptr, nullptr, "PS", "ps_5_0", 0, 0, pSkyPSBlob.GetAddressOf(), errorBlob.GetAddressOf());
+        D3DCompileFromFile(L"EdgeShader.hlsl", nullptr, nullptr, "EdgePS", "ps_5_0", 0, 0, pEdgePSBlob.GetAddressOf(), errorBlob.GetAddressOf());
 
         gfx.pd3dDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, pVertexShader.GetAddressOf());
         gfx.pd3dDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, pPixelShader.GetAddressOf());
@@ -99,6 +101,7 @@ public:
         gfx.pd3dDevice->CreatePixelShader(pBlurPSBlob->GetBufferPointer(), pBlurPSBlob->GetBufferSize(), nullptr, pBlurPixelShader.GetAddressOf());
         gfx.pd3dDevice->CreateVertexShader(pSkyVSBlob->GetBufferPointer(), pSkyVSBlob->GetBufferSize(), nullptr, pSkyVertexShader.GetAddressOf());
         gfx.pd3dDevice->CreatePixelShader(pSkyPSBlob->GetBufferPointer(), pSkyPSBlob->GetBufferSize(), nullptr, pSkyPixelShader.GetAddressOf());
+        gfx.pd3dDevice->CreatePixelShader(pEdgePSBlob->GetBufferPointer(), pEdgePSBlob->GetBufferSize(), nullptr, pEdgePixelShader.GetAddressOf());
 
         // B. 创建布局和光栅化状态
         D3D11_INPUT_ELEMENT_DESC layout[] = {
@@ -167,43 +170,21 @@ public:
     }
 
     // =====================================
-    // 4. 数据更新
-    // =====================================
-    void UpdateGlobalCB(GraphicsDevice& gfx, Camera& cam, EnvironmentSystem& env) {
-        ConstantBufferStruct cb = {};
-        cb.WorldViewProj = XMMatrixTranspose(cam.GetViewMatrix() * cam.GetProjMatrix(800.0f / 600.0f));
-        cb.LightViewProj = XMMatrixTranspose(env.sunMatrix);
-        cb.InvViewProj = XMMatrixTranspose(XMMatrixInverse(nullptr, cam.GetViewMatrix() * cam.GetProjMatrix(800.0f / 600.0f)));
-        cb.LightDirToSun = env.lightDir;
-        cb.CameraPos = XMFLOAT4(cam.camPos.x, cam.camPos.y, cam.camPos.z, 1.0f);
-        cb.WeatherParams = env.WeatherParams;
-        cb.Time = env.TotalTime;
-        cb.SkyParams = env.SkyParams;
-
-        gfx.pImmediateContext->UpdateSubresource(pConstantBuffer.Get(), 0, nullptr, &cb, 0, 0);
-        gfx.pImmediateContext->VSSetConstantBuffers(0, 1, pConstantBuffer.GetAddressOf());
-        gfx.pImmediateContext->PSSetConstantBuffers(0, 1, pConstantBuffer.GetAddressOf());
-    }
-
-    // =====================================
      // 5. 渲染图构建 (Render Graph)
      // =====================================
     void BuildGraph(RenderGraph& graph, GraphicsDevice& gfx, TerrainInteropManager& terrain, Camera& cam, EnvironmentSystem& env) {
 
         m_hBackBuffer = graph.ImportRenderTarget("BackBuffer", gfx.pRenderTargetView.Get(), gfx.pDepthStencilView.Get());
 
-        // --- Shadow Pass ---
+        // --- 1. Shadow Pass ---
         graph.AddPass("ShadowPass",
             [&](RenderGraphBuilder& builder) {
-                // 直接存入成员变量
                 m_hRawVSM = builder.CreateTexture("VSM_Raw", { 2048, 2048, DXGI_FORMAT_R32G32_FLOAT, false });
                 m_hShadowDepth = builder.CreateTexture("ShadowMap", { 2048, 2048, DXGI_FORMAT_UNKNOWN, true });
                 builder.Write(m_hRawVSM);
                 builder.Write(m_hShadowDepth);
             },
-            // 不再按值捕获局部变量，直接通过 this 访问成员！
             [this, &terrain, &env, &cam](GraphicsDevice& gfx, RenderGraphRegistry& registry) {
-                // 把所有参数都填满，防止 RenderDoc 看着全为 0 引起你的误解！
                 ConstantBufferStruct cbShadow = {};
                 cbShadow.WorldViewProj = XMMatrixTranspose(env.sunMatrix);
                 cbShadow.LightViewProj = XMMatrixTranspose(env.sunMatrix);
@@ -218,7 +199,6 @@ public:
                 gfx.pImmediateContext->VSSetConstantBuffers(0, 1, pConstantBuffer.GetAddressOf());
                 gfx.pImmediateContext->PSSetConstantBuffers(0, 1, pConstantBuffer.GetAddressOf());
 
-                // 使用成员变量安全获取物理贴图！
                 auto rtv = registry.GetRTV(m_hRawVSM);
                 auto dsv = registry.GetDSV(m_hShadowDepth);
 
@@ -239,7 +219,7 @@ public:
             }
         );
 
-        // --- Blur X Pass ---
+        // --- 2. Blur X Pass ---
         graph.AddPass("BlurXPass",
             [&](RenderGraphBuilder& builder) {
                 m_hBlurX = builder.CreateTexture("VSM_BlurX", { 2048, 2048, DXGI_FORMAT_R32G32_FLOAT, false });
@@ -266,7 +246,7 @@ public:
             }
         );
 
-        // --- Blur Y Pass ---
+        // --- 3. Blur Y Pass ---
         graph.AddPass("BlurYPass",
             [&](RenderGraphBuilder& builder) {
                 m_hFinalVSM = builder.CreateTexture("VSM_Final", { 2048, 2048, DXGI_FORMAT_R32G32_FLOAT, false });
@@ -286,11 +266,15 @@ public:
             }
         );
 
-        // --- Main PBR Pass ---
+        // --- 4. Main PBR Pass ---
         graph.AddPass("MainPass",
             [&](RenderGraphBuilder& builder) {
+                // 【核心修改】：在这里向系统申请一张和屏幕一样大的干净画布
+                m_hSceneColor = builder.CreateTexture("SceneColor", { 800, 600, DXGI_FORMAT_R8G8B8A8_UNORM, false });
                 builder.Read(m_hFinalVSM);
-                builder.Write(m_hBackBuffer);
+
+                builder.Write(m_hSceneColor); // 画在虚拟画布上
+                builder.Write(m_hBackBuffer); // 因为要用到主屏幕的 DepthBuffer
             },
             [this, &terrain, &cam, &env](GraphicsDevice& gfx, RenderGraphRegistry& registry) {
                 ConstantBufferStruct cbMain = {};
@@ -307,8 +291,9 @@ public:
                 gfx.pImmediateContext->VSSetConstantBuffers(0, 1, pConstantBuffer.GetAddressOf());
                 gfx.pImmediateContext->PSSetConstantBuffers(0, 1, pConstantBuffer.GetAddressOf());
 
+                // 【核心修改】：拿出刚才申请的虚拟画布
                 auto rtv = registry.GetRTV(m_hBackBuffer);
-                auto dsv = registry.GetDSV(m_hBackBuffer);
+                auto dsv = registry.GetDSV(m_hBackBuffer); // 借用主屏幕的深度图
 
                 float clearColor[4] = { 0.05f, 1.0f, 1.0f, 1.0f };
                 gfx.pImmediateContext->ClearRenderTargetView(rtv, clearColor);
@@ -337,9 +322,11 @@ public:
             }
         );
 
-        // --- Sky Pass ---
+        // --- 5. Sky Pass ---
         graph.AddPass("SkyPass",
             [&](RenderGraphBuilder& builder) {
+                // 【核心修改】：天空也画在虚拟画布上
+                builder.Write(m_hSceneColor);
                 builder.Write(m_hBackBuffer);
             },
             [this](GraphicsDevice& gfx, RenderGraphRegistry& registry) {
@@ -353,14 +340,13 @@ public:
 
                 gfx.pImmediateContext->VSSetShader(pSkyVertexShader.Get(), nullptr, 0);
                 gfx.pImmediateContext->PSSetShader(pSkyPixelShader.Get(), nullptr, 0);
-
-                // 保险起见，给天空盒也补上一枪 CB 绑定
                 gfx.pImmediateContext->PSSetConstantBuffers(0, 1, pConstantBuffer.GetAddressOf());
 
                 gfx.pImmediateContext->Draw(3, 0);
-
                 gfx.pImmediateContext->OMSetDepthStencilState(nullptr, 0);
             }
         );
+
+        
     }
 };

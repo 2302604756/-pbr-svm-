@@ -30,6 +30,7 @@ class RenderGraph;
 
 // 注册机：在 Execute 阶段供 Pass 获取真实的 DX11 指针
 class RenderGraphRegistry {
+    //利用哈希表来实现虚拟纹理描述与物理资源的映射
     std::unordered_map<RGHandle, RGPhysicalResource>* m_resources;
 public:
     RenderGraphRegistry(std::unordered_map<RGHandle, RGPhysicalResource>* res) : m_resources(res) {}
@@ -65,11 +66,11 @@ class RenderGraph {
     friend class RenderGraphBuilder;
 private:
     uint32_t m_nextHandle = 1;
-    std::unordered_map<RGHandle, RGTextureDesc> m_virtualResources;
-    std::unordered_map<RGHandle, std::string> m_resourceNames;
-    std::unordered_map<RGHandle, RGPhysicalResource> m_physicalResources;
+    std::unordered_map<RGHandle, RGTextureDesc> m_virtualResources;     //虚拟资源desc
+    std::unordered_map<RGHandle, std::string> m_resourceNames;          //资源名称
+    std::unordered_map<RGHandle, RGPhysicalResource> m_physicalResources;//物理资源
 
-    std::vector<RGPassNode> m_passes;
+    std::vector<RGPassNode> m_passes;//存passnode 里面有
     std::vector<uint32_t> m_sortedPassIndices;
 
 public:
@@ -90,6 +91,7 @@ public:
         RGPassNode node;
         node.Name = name;
         m_passes.push_back(node);
+        //快速指定到当前索引
         uint32_t passIdx = m_passes.size() - 1;
 
         RenderGraphBuilder builder(this, passIdx);
@@ -153,7 +155,7 @@ public:
 
         for (uint32_t idx : m_sortedPassIndices) {
             auto& pass = m_passes[idx];
-
+            
             // 执行核心渲染回调
             pass.ExecuteCallback(gfx, registry);
 

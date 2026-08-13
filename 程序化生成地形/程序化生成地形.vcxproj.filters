@@ -6,27 +6,41 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="stb_image.cpp" />
+    <ClCompile Include="dx12Graph.cpp">
+      <Filter>shaders</Filter>
+    </ClCompile>
+    <ClCompile Include="dx12Graphline.cpp">
+      <Filter>shaders</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="shaders">
       <UniqueIdentifier>{4f93090a-fbe9-43bd-bbd5-7e18b885b240}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="数据部分">
+      <UniqueIdentifier>{9ef8ad96-704c-4b85-962a-14291525f037}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="TerrainInteropManager.h" />
     <ClInclude Include="stb_image.h" />
     <ClInclude Include="GraphicsDevice.h" />
-    <ClInclude Include="RenderData.h" />
     <ClInclude Include="Camera.h" />
     <ClInclude Include="Environment.h" />
     <ClInclude Include="RenderPipeline.h" />
     <ClInclude Include="RenderGraph.h" />
+    <ClInclude Include="RenderData.h">
+      <Filter>数据部分</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="shader.hlsl">
       <Filter>shaders</Filter>
     </None>
     <None Include="SkyShader.hlsl">
+      <Filter>shaders</Filter>
+    </None>
+    <None Include="EdgeShader.hlsl">
       <Filter>shaders</Filter>
     </None>
   </ItemGroup>

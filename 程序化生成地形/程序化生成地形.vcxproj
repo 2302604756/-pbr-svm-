@@ -82,6 +82,8 @@
     <CudaCompile Include="TerrainKernel.cu" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="dx12Graph.cpp" />
+    <ClCompile Include="dx12Graphline.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="stb_image.cpp" />
   </ItemGroup>
@@ -103,6 +105,11 @@
   <ItemGroup>
     <None Include="SkyShader.hlsl">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ExcludedFromBuild>
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="EdgeShader.hlsl">
       <FileType>Document</FileType>
     </None>
   </ItemGroup>

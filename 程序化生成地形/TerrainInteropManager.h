@@ -33,7 +33,7 @@ class TerrainInteropManager {
 private:
     const int GRID_SIZE = 256;            // 每个 Chunk 128x128 个顶点 (太大容易卡顿)
     const float SPACING = 1.5f;           // 顶点间距
-    const float CHUNK_SIZE = (GRID_SIZE - 1) * SPACING; // 单个 Chunk 的物理边长 = 190.5 米
+    const float CHUNK_SIZE = (GRID_SIZE - 1) * SPACING; // 单个 Chunk 的物理边长 
     const int VIEW_DISTANCE = 2;          // 渲染半径 (2 代表 5x5 = 25 个区块)
     const int POOL_SIZE = 36;             // 显存池容量 (必须大于渲染区块数)
     int m_verticesPerChunk = 0;
@@ -57,7 +57,7 @@ public:
     // 1. 初始化系统：一次性申请所有显存
     // ==========================================
     bool Initialize(ID3D11Device* d3dDevice) {
-        m_verticesPerChunk = (GRID_SIZE - 1) * (GRID_SIZE - 1) * 6;
+        m_verticesPerChunk = (GRID_SIZE - 1) * (GRID_SIZE - 1) * 6;  //正方形数量 * 2 个三角形 * 3个顶点
 
         unsigned int deviceCount = 0;
         int cudaDevice = 0;
@@ -166,7 +166,7 @@ public:
         m_activeChunks.clear();
     }
     // ==========================================
-    // 【新增】云层更新函数 (接受 main.cpp 传来的句柄)
+    // 云层更新函数 (接受 main.cpp 传来的句柄)
     // ==========================================
     void UpdateCloudVolume(cudaGraphicsResource_t cloudCudaRes) {
         // 安全检查：防止传入空指针导致 CUDA 崩溃
